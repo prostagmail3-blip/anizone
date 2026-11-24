@@ -2514,6 +2514,7 @@ async def cb_pick(cb: CallbackQuery, state: FSMContext) -> None:
         anime = await db.get_anime(anime_id)
         if anime:
             await send_post(cb.bot, cb.from_user.id, anime, protect=False)  # type: ignore[arg-type]
+            await offer_post_channels(cb.message, state, anime["id"])  # type: ignore[arg-type]
 
 
 @admin_router.callback_query(F.data.startswith("ae:"))
@@ -2610,26 +2611,34 @@ async def msg_edit_del_episode(message: Message, state: FSMContext) -> None:
 
 
 # ---------------- Post Tayyorlash ----------------
-def build_post_text(anime: asyncpg.Record, main_url: str) -> str:
+def channel_handle(url: str) -> str:
+    """https://t.me/anizone_anime -> @anizone_anime (aks holda havolaning o'zi)."""
+    m = re.match(r"^https?://t\.me/([A-Za-z0-9_]{4,})/?$", (url or "").strip())
+    return f"@{m.group(1)}" if m else (url or "").strip()
+
+
+def build_post_text(anime: asyncpg.Record, main_url: str, ep_count: int = 0) -> str:
+    line = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
     lines = [
-        "🔥 <b>Yangi anime</b>",
-        "",
-        f"🎬 <b>{esc(anime['name'])}</b>",
-        "",
-        f"🔖 Janri: {esc(anime['genre'] or '—')}",
-        f"📅 Yili: {esc(anime['year'] or '—')}",
-        f"🎙 Dublyaj: {esc(anime['studio'] or '—')}",
-        "━━━━━━━━━━━━━━━",
-        f"🆔 Kod: <code>{anime['id']}</code>",
+        "✨ <b>YANGI Anime</b> ✨",
+        line,
+        f"🎞 <b>Nomi:</b> {esc(anime['name'])}",
+        f"🗓 <b>Yili:</b> {esc(anime['year'] or '—')}",
+        f"📂 <b>Janri:</b> {esc(anime['genre'] or '—')}",
+        f"💎 <b>Qismlar:</b> {ep_count}",
+        f"🎙 <b>Ovoz berdi:</b> {esc(anime['studio'] or '—')}",
+        line,
+        f"🔑 <b>Kodi:</b> <code>{anime['id']}</code>",
     ]
     if main_url:
-        lines.append(f"📢 Asosiy kanal: {esc(main_url)}")
+        lines.append(f"🚀 <b>Kanalimiz:</b> {esc(channel_handle(main_url))}")
     return "\n".join(lines)
 
 
 async def send_post(bot: Bot, chat_id: int, anime: asyncpg.Record, protect: bool = False) -> bool:
     main_url = await db.get_setting("main_channel_url")
-    text = build_post_text(anime, main_url)
+    ep_count = await db.count_episodes(anime["id"])
+    text = build_post_text(anime, main_url, ep_count)
     try:
         if anime["photo_id"]:
             await bot.send_photo(chat_id, anime["photo_id"], caption=text, protect_content=protect)
@@ -2654,6 +2663,79 @@ async def msg_post_query(message: Message, state: FSMContext) -> None:
     if anime:
         await state.clear()
         await send_post(message.bot, message.chat.id, anime)  # type: ignore[arg-type]
+        await offer_post_channels(message, state, anime["id"])
+
+
+def postchan_kb(channels: List[asyncpg.Record], selected: List[int]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for ch in channels:
+        mark = "✅" if ch["id"] in selected else "⬜️"
+        kb.row(InlineKeyboardButton(text=f"{mark} {ch['title'] or ch['chat_id']}"[:60],
+                                    callback_data=f"pp:t:{ch['id']}"))
+    kb.row(InlineKeyboardButton(text="📤 Yuborish", callback_data="pp:send"),
+           InlineKeyboardButton(text="❌ Bekor", callback_data="pp:cancel"))
+    return kb.as_markup()
+
+
+async def offer_post_channels(target: Message, state: FSMContext, anime_id: int) -> None:
+    """Post tayyor bo'lgach, post kanallarini tanlash uchun ko'rsatadi."""
+    channels = await db.list_channels("post")
+    if not channels:
+        await target.answer("ℹ️ Post kanallari qo'shilmagan. Owner «📢 Kanallarni Sozlash» orqali qo'shsa, "
+                            "postni to'g'ridan-to'g'ri kanalga yuborish mumkin bo'ladi.")
+        return
+    await state.update_data(pp_anime=anime_id, pp_selected=[])
+    await target.answer("📤 Postni qaysi kanallarga yuboramiz?", reply_markup=postchan_kb(channels, []))
+
+
+@admin_router.callback_query(F.data.startswith("pp:"))
+async def cb_post_channels(cb: CallbackQuery, state: FSMContext) -> None:
+    parts = (cb.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    data = await state.get_data()
+    anime_id = data.get("pp_anime")
+    selected: List[int] = list(data.get("pp_selected", []))
+    if action == "cancel":
+        await answer_cb(cb)
+        await state.update_data(pp_anime=None, pp_selected=[])
+        await smart_send(cb, "Bekor qilindi.")
+        return
+    if not anime_id:
+        await answer_cb(cb, "Jarayon topilmadi. Postni qaytadan tayyorlang.", alert=True)
+        return
+    channels = await db.list_channels("post")
+    if action == "t" and len(parts) == 3 and parts[2].isdigit():
+        cid = int(parts[2])
+        if cid in selected:
+            selected.remove(cid)
+        else:
+            selected.append(cid)
+        await state.update_data(pp_selected=selected)
+        await answer_cb(cb)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=postchan_kb(channels, selected))  # type: ignore[union-attr]
+        except TelegramBadRequest:
+            pass
+        return
+    if action == "send":
+        if not selected:
+            await answer_cb(cb, "Hech bo'lmasa bitta kanal tanlang", alert=True)
+            return
+        anime = await db.get_anime(anime_id)
+        if not anime:
+            await answer_cb(cb, "Anime topilmadi", alert=True)
+            return
+        await answer_cb(cb, "Yuborilmoqda...")
+        ok = fail = 0
+        for ch in [c for c in channels if c["id"] in selected]:
+            if await send_post(cb.bot, ch["chat_id"], anime, protect=False):  # type: ignore[arg-type]
+                ok += 1
+            else:
+                fail += 1
+            await asyncio.sleep(0.6)
+        await state.update_data(pp_anime=None, pp_selected=[])
+        await db.add_log(cb.from_user.id, "post_send", f"anime={anime_id} ok={ok} fail={fail}")
+        await smart_send(cb, f"✅ Post yuborildi.\nKanalga yetdi: {ok}\nXato: {fail}")
 
 
 # ---------------- Avto Post ----------------
